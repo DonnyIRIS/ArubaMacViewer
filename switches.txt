@@ -1,0 +1,5 @@
+# One switch per line: IP,Name
+# Names are filled in by Aruba Switch MAC Address Viewer when it logs in to the switch.
+192.168.1.10
+192.168.1.11
+192.168.1.20

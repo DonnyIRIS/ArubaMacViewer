@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ArubaMacViewer</RootNamespace>
+    <AssemblyName>ArubaMacViewer</AssemblyName>
+    <Version>1.5.4</Version>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Product>Aruba Switch MAC Address Viewer</Product>
+    <Company>SF IT Americas</Company>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SF IT Americas logo: shown in the title bar, taskbar and Explorer -->
+    <EmbeddedResource Include="app.ico" LogicalName="ArubaMacViewer.app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SSH client library used to log into the switches -->
+    <PackageReference Include="SSH.NET" Version="2025.0.0" />
+    <!-- Windows DPAPI, used to encrypt saved credentials -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <!-- Excel (.xlsx) export, no Excel installation required -->
+    <PackageReference Include="ClosedXML" Version="0.104.2" />
+  </ItemGroup>
+
+</Project>

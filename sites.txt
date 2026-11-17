@@ -1,0 +1,4 @@
+# Optional site names for the Excel export: subnet,site name
+# Any switch whose IP falls inside the subnet goes on that site's tab.
+10.162.125.0/24,SLC - Salt Lake City
+10.162.30.0/24,SFA - Site A
