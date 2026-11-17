@@ -140,6 +140,7 @@ public static partial class SwitchClient
                         e.AccessVlan = info.AccessOrUntaggedVlan;
                         e.IsUplink = info.IsUplinkLike;
                         e.CxTrunkAllowedAll = info.IsCxTrunkAllowedAll && Is6000Series(model);
+                        e.Nac = info.NacSummary();
                         matched++;
                     }
                 }
@@ -521,9 +522,21 @@ public static partial class SwitchClient
     /// <summary>What to do with a port: change its untagged/native VLAN, or turn it into an access port.</summary>
     public record PortAction(string Port, bool ConvertToAccess);
 
+    /// <summary>
+    /// NAC handling during a VLAN change. When ports to be changed have "aaa port-access ..." configured, <see cref="Ask"/>
+    /// is called (on the worker thread) with the hostname and port -> its NAC lines; it returns true to remove NAC right
+    /// after the VLAN change (running <see cref="Commands"/> for each port, {port} replaced), false to leave NAC as it is,
+    /// or null to cancel the change on that switch. Removal is ProVision only (the commands are ProVision syntax).
+    /// </summary>
+    public class NacOption
+    {
+        public IList<string> Commands { get; set; } = new List<string>();
+        public Func<string, IReadOnlyDictionary<string, List<string>>, bool?>? Ask { get; set; }
+    }
+
     public static VlanChangeResult ChangeAccessVlan(SwitchEntry sw, IList<Credential> credentials, IList<PortAction> actions,
                                                     string newVlan, bool saveConfig, bool dryRun,
-                                                    Action<string> log, CancellationToken ct)
+                                                    Action<string> log, CancellationToken ct, NacOption? nac = null)
     {
         var ports = actions.Select(a => a.Port).ToList();
         bool ConvertRequested(string port) => actions.FirstOrDefault(a => RunningConfigParser.Key(a.Port).Equals(RunningConfigParser.Key(port), StringComparison.OrdinalIgnoreCase))?.ConvertToAccess ?? false;
@@ -585,7 +598,8 @@ public static partial class SwitchClient
                     (info.IsTrunk && Convert(p) ? $"convert to ACCESS port on VLAN {newVlan} (removes tagged: {(isCx ? info.AllowedVlans : string.Join(",", info.TaggedVlans))})"
                      : KeepTrunk(info) ? $"6000-series trunk 'allowed all' stays - native VLAN {info.AccessOrUntaggedVlan} -> {newVlan}"
                      : info.IsTrunk ? $"native/untagged VLAN {info.AccessOrUntaggedVlan} -> {newVlan} (tagged VLANs unchanged)"
-                                    : $"access VLAN {info.AccessOrUntaggedVlan} -> {newVlan}");
+                                    : $"access VLAN {info.AccessOrUntaggedVlan} -> {newVlan}") +
+                    (info.HasNac ? $" - NAC configured ({info.NacSummary()}); you will be asked whether to remove it" : "");
             }
             log($"[{hostname}] Validation only - {todo.Count} port(s) eligible, nothing changed.");
             try { shell.WriteLine("exit"); } catch { }
@@ -596,6 +610,33 @@ public static partial class SwitchClient
             try { shell.WriteLine("exit"); } catch { }
             return result;
         }
+
+        // ---- NAC on the ports being changed? Ask before touching anything. ----
+        var nacPorts = todo.Where(p => portInfo.TryGetValue(RunningConfigParser.Key(p), out var i) && i.HasNac)
+                           .ToDictionary(p => p, p => portInfo[RunningConfigParser.Key(p)].NacLines, StringComparer.OrdinalIgnoreCase);
+        bool removeNac = false;
+        if (nacPorts.Count > 0)
+        {
+            log($"[{hostname}] NAC (aaa port-access) is configured on {nacPorts.Count} of the port(s) to change: {string.Join(", ", nacPorts.Keys)}");
+            if (nac?.Ask != null)
+            {
+                var answer = nac.Ask(hostname, nacPorts);
+                if (answer == null)
+                {
+                    foreach (var p in todo) result.PortResults[p] = "Cancelled - no changes made.";
+                    log($"[{hostname}] VLAN change cancelled at the NAC question. No changes made.");
+                    try { shell.WriteLine("exit"); } catch { }
+                    return result;
+                }
+                removeNac = answer.Value && nac.Commands.Count > 0;
+                if (answer.Value && isCx)
+                {
+                    removeNac = false;
+                    log($"[{hostname}] NAC removal is only supported on ProVision switches; this is AOS-CX - VLAN changed, NAC left as is.");
+                }
+            }
+        }
+        var nacNote = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         // ---- Apply ----
         log($"[{hostname}] Changing {todo.Count} port(s) to access VLAN {newVlan} ({(isCx ? "AOS-CX" : "ProVision")}) ...");
@@ -665,8 +706,26 @@ public static partial class SwitchClient
             bool err = IsCliError(outp);
             foreach (var p in todo)
                 result.PortResults[p] = convertErrors.TryGetValue(p, out var ce) ? ce : err ? "Error: " + FirstLine(outp) : "OK";
-            Exec(shell, "exit", log, hostname, ct);
-            Exec(shell, "exit", log, hostname, ct);
+            Exec(shell, "exit", log, hostname, ct);          // leave the vlan context, stay in config mode
+
+            if (removeNac && nac != null)
+            {
+                var lines = nac.Commands.Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith('#') && !l.StartsWith("//")).ToList();
+                foreach (var p in nacPorts.Keys.Where(p => result.PortResults.TryGetValue(p, out var r) && r == "OK"))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    log($"[{hostname}] Removing NAC from port {p} ...");
+                    string? firstError = null;
+                    foreach (var tpl in lines)
+                    {
+                        var cmd = tpl.Replace("{port}", p, StringComparison.OrdinalIgnoreCase);
+                        var o = Exec(shell, cmd, log, hostname, ct);
+                        if (IsCliError(o) && firstError == null) firstError = $"'{cmd}': {FirstLine(o)}";
+                    }
+                    nacNote[p] = firstError == null ? "NAC removed" : "NAC removal failed at " + firstError;
+                }
+            }
+            Exec(shell, "exit", log, hostname, ct);          // leave config mode
         }
 
         if (saveConfig)
@@ -690,6 +749,16 @@ public static partial class SwitchClient
                 result.PortResults[p] = "OK (now an access port)";
             else if (KeepTrunk(after))
                 result.PortResults[p] = "OK (trunk kept, native VLAN changed)";
+
+            // NAC outcome, verified against the re-read config
+            if (!result.PortResults[p].StartsWith("OK", StringComparison.OrdinalIgnoreCase)) continue;
+            if (nacNote.TryGetValue(p, out var note))
+            {
+                if (note == "NAC removed" && after.HasNac) note = $"NAC removal sent but the switch still shows: {after.NacSummary()}";
+                result.PortResults[p] += " - " + note;
+            }
+            else if (nacPorts.ContainsKey(p) && after.HasNac)
+                result.PortResults[p] += $" - NAC left as is ({after.NacSummary()})";
         }
 
         try { shell.WriteLine("exit"); } catch { }

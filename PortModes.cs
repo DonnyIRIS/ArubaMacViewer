@@ -27,6 +27,30 @@ public class PortInfo
     public string AllowedVlans { get; set; } = "";
     public string AccessVlan { get; set; } = "";
 
+    /// <summary>
+    /// NAC lines configured on the port, from the running config: ProVision "aaa port-access authenticator",
+    /// "aaa port-access mac-based", "aaa port-access mixed" ... (inside the interface block or as global
+    /// "aaa port-access authenticator 1-24" lines) and AOS-CX "aaa authentication port-access ..." lines.
+    /// </summary>
+    public List<string> NacLines { get; } = new();
+    public bool HasNac => NacLines.Count > 0;
+
+    /// <summary>Short NAC summary: "authenticator, mac-based, mixed" (ProVision) / "dot1x, mac-auth" (AOS-CX).</summary>
+    public string NacSummary()
+    {
+        var kinds = new List<string>();
+        foreach (var l in NacLines)
+        {
+            var rest = l.StartsWith("aaa port-access ", StringComparison.OrdinalIgnoreCase) ? l[16..]
+                     : l.StartsWith("aaa authentication port-access ", StringComparison.OrdinalIgnoreCase) ? l[31..]
+                     : l.StartsWith("port-access ", StringComparison.OrdinalIgnoreCase) ? l[12..]
+                     : l;
+            var kind = rest.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+            if (kind.Length > 0 && !kinds.Contains(kind, StringComparer.OrdinalIgnoreCase)) kinds.Add(kind);
+        }
+        return string.Join(", ", kinds);
+    }
+
     /// <summary>True for LAGs, LAG members and any port carrying tagged VLANs.</summary>
     public bool IsUplinkLike =>
         LagMembers.Count > 0 || MemberOfLag.Length > 0 || TaggedVlans.Count > 0 || IsTrunkMode;
@@ -83,6 +107,7 @@ public class PortInfo
             else if (UntaggedVlan.Length > 0)
                 parts.Add($"Access (VLAN {UntaggedVlan})");
         }
+        if (HasNac) parts.Add("NAC: " + NacSummary());
         return string.Join(" \u00B7 ", parts);
     }
 }
@@ -103,6 +128,16 @@ public static class RunningConfigParser
     private static readonly Regex ProvInterface = new(@"^interface\s+([A-Za-z]{0,3}\d{1,3}|Trk\d+)\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ProvName = new(@"^\s+name\s+""?(.*?)""?\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex PortToken = new(@"^([A-Za-z]*)(\d+)$", RegexOptions.Compiled);
+    // Global ProVision form: "aaa port-access authenticator 1-24", "aaa port-access mac-based 5,7 addr-limit 2",
+    // "aaa port-access 1-24 controlled-direction in". Lines like "aaa port-access authenticator active" (no port list) do not match.
+    private static readonly Regex ProvGlobalNac = new(
+        @"^aaa\s+port-access\s+(?:(authenticator|mac-based|web-based|supplicant|local-mac)\s+)?((?:[A-Za-z]{0,3}\d{1,3}(?:-[A-Za-z]{0,3}\d{1,3})?)(?:,[A-Za-z]{0,3}\d{1,3}(?:-[A-Za-z]{0,3}\d{1,3})?)*)(\s+.*)?$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static void AddNac(PortInfo p, string line)
+    {
+        if (!p.NacLines.Contains(line, StringComparer.OrdinalIgnoreCase)) p.NacLines.Add(line);
+    }
 
     public static Dictionary<string, PortInfo> Parse(string config)
     {
@@ -145,6 +180,14 @@ public static class RunningConfigParser
                 var v = VlanBlock.Match(line);
                 if (v.Success) { currentVlan = v.Groups[1].Value; continue; }
 
+                var gn = ProvGlobalNac.Match(line);
+                if (gn.Success)
+                {
+                    var text = ("aaa port-access " + gn.Groups[1].Value + gn.Groups[3].Value.TrimEnd()).Replace("  ", " ").Trim();
+                    foreach (var port in ExpandPortList(gn.Groups[2].Value)) AddNac(Get(port), text);
+                    continue;
+                }
+
                 var i = CxInterface.Match(line);
                 if (i.Success)
                 {
@@ -162,6 +205,8 @@ public static class RunningConfigParser
             {
                 var nm = ProvName.Match(line);
                 if (nm.Success) currentProvIf.Name = nm.Groups[1].Value.Trim();
+                else if (line.Trim().StartsWith("aaa port-access", StringComparison.OrdinalIgnoreCase))
+                    AddNac(currentProvIf, line.Trim());
                 continue;
             }
 
@@ -208,6 +253,9 @@ public static class RunningConfigParser
                     currentCxIf.IsTrunkMode = true;
                 else if (l.StartsWith("description ", StringComparison.OrdinalIgnoreCase))
                     currentCxIf.Name = l[12..].Trim();
+                else if (l.StartsWith("aaa authentication port-access", StringComparison.OrdinalIgnoreCase) ||
+                         l.StartsWith("port-access ", StringComparison.OrdinalIgnoreCase))
+                    AddNac(currentCxIf, l);
             }
         }
 

@@ -1202,7 +1202,7 @@ public partial class MainForm : Form
                 SwitchIp = first.SwitchIp, Switch = first.Switch, SwitchModel = first.SwitchModel, Site = first.Site,
                 Mac = first.Mac, Vendor = first.Vendor, Port = first.Port,
                 PortType = first.PortType, PortMode = first.PortMode, AccessVlan = first.AccessVlan,
-                PortNote = first.PortNote, IsUplink = first.IsUplink, CxTrunkAllowedAll = first.CxTrunkAllowedAll,
+                PortNote = first.PortNote, IsUplink = first.IsUplink, CxTrunkAllowedAll = first.CxTrunkAllowedAll, Nac = first.Nac,
                 DeviceType = first.DeviceType, Neighbor = first.Neighbor, NeighborDetail = first.NeighborDetail,
                 SwitchLink = first.SwitchLink, LinkedSwitchIp = first.LinkedSwitchIp,
                 IpAddress = first.IpAddress, IpSource = first.IpSource, DnsName = first.DnsName, DhcpHostname = first.DhcpHostname, PortName = first.PortName,
@@ -2413,12 +2413,15 @@ public partial class MainForm : Form
                     SelectedDevices = g.Select(x => x.Mac).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
                     IsLag = all.Any(x => x.PortType.Contains("LAG", StringComparison.OrdinalIgnoreCase)),
                     IsTrunk = all.Any(x => x.PortType.StartsWith("Trunk", StringComparison.OrdinalIgnoreCase)),
-                    CxTrunkAllowedAll = all.Any(x => x.CxTrunkAllowedAll)
+                    CxTrunkAllowedAll = all.Any(x => x.CxTrunkAllowedAll),
+                    Nac = all.Select(x => x.Nac).FirstOrDefault(n => n.Length > 0) ?? ""
                 };
             })
             .ToList();
 
         using var dlg = new VlanChangeDialog(plans, settings.LastTargetVlan,
+            nacCommands: (settings.NacDisableCommands.Length > 0 ? settings.NacDisableCommands : AppSettings.DefaultNacDisableCommands)
+                         .Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0).ToList(),
             credentialsFor: sw => OrderForSwitch(creds, sw),
             log: Log,
             onPortsUpdated: (sw, ports) =>
@@ -2433,6 +2436,7 @@ public partial class MainForm : Form
                         en.AccessVlan = info.AccessOrUntaggedVlan;
                         en.IsUplink = info.IsUplinkLike;
                         en.CxTrunkAllowedAll = info.IsCxTrunkAllowedAll && SwitchClient.Is6000Series(en.SwitchModel);
+                        en.Nac = info.NacSummary();
                     }
                 }
                 ApplyVlanLabels(allEntries);

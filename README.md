@@ -474,6 +474,21 @@ re-queries until **Clear marks**.
    Every command and the switch's reply are written to the log. The changed rows update immediately,
    and a few seconds later the affected switches are queried again automatically so the list shows
    what they now report. Untick *Save configuration* to leave the change unsaved.
+5. **NAC on the ports (aaa port-access).** Ports whose running config has NAC lines (`aaa port-access
+   authenticator`, `aaa port-access mac-based`, `aaa port-access mixed`, either inside the `interface N`
+   block or as global `aaa port-access authenticator 1-24` lines) are flagged in the plan
+   ("NAC configured (authenticator, mac-based)") and show `NAC: ...` in the Port mode column. When you
+   click *Apply changes...* and any of the ports has NAC, one question is asked for the whole run:
+   - **Yes** - change the VLAN and then remove NAC from those ports, in the same session, using the
+     commands from *Disable NAC on port* (editable there; `{port}` is replaced by the port). The result
+     reads `OK - NAC removed`, and the re-read config is checked to confirm the aaa lines are gone.
+   - **No** - change the VLAN only; the result reads `OK - NAC left as is (authenticator, mac-based)`.
+   - **Cancel** - nothing is changed.
+   Ports without NAC are changed as usual and never asked about. If a switch's fresh config shows NAC on
+   ports the app did not know about, the same question appears for that switch. Removal is ProVision
+   only (the commands are ProVision syntax); on AOS-CX the VLAN is changed and NAC is left alone.
+   `spanning-tree admin-edge-port` / `bpdu-protection` are removed by the default commands;
+   `loop-protect` is not - add `no loop-protect {port}` to the commands in *Disable NAC on port* if you want it gone too.
 
 The target VLAN must already exist on the switch; the app never creates VLANs.
 Devices moved to a new VLAN will need a new IP (DHCP lease) before they are reachable again.

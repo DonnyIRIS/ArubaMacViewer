@@ -17,11 +17,14 @@ public class VlanChangeDialog : Form
         public bool IsTrunk { get; set; }
         /// <summary>6000-series "vlan trunk allowed all" port: stays a trunk, only the native VLAN changes.</summary>
         public bool CxTrunkAllowedAll { get; set; }
+        /// <summary>NAC configured on the port per the last running-config read ("authenticator, mac-based"); "" if none.</summary>
+        public string Nac { get; set; } = "";
         public string Reason { get; set; } = "";                  // why it is skipped (empty = eligible)
         public ListViewItem? Row { get; set; }
     }
 
     private readonly List<PortPlan> plans;
+    private readonly IList<string> nacCommands;
     private readonly Func<SwitchEntry, IList<Credential>> credentialsFor;
     private readonly Action<string> log;
     private readonly Action<SwitchEntry, Dictionary<string, PortInfo>> onPortsUpdated;
@@ -39,11 +42,13 @@ public class VlanChangeDialog : Form
     private CancellationTokenSource? cts;
 
     public VlanChangeDialog(List<PortPlan> plans, int defaultVlan,
+                            IList<string> nacCommands,
                             Func<SwitchEntry, IList<Credential>> credentialsFor,
                             Action<string> log,
                             Action<SwitchEntry, Dictionary<string, PortInfo>> onPortsUpdated)
     {
         this.plans = plans;
+        this.nacCommands = nacCommands;
         this.credentialsFor = credentialsFor;
         this.log = log;
         this.onPortsUpdated = onPortsUpdated;
@@ -67,7 +72,8 @@ public class VlanChangeDialog : Form
         top.Controls.Add(chkTrunk);
         top.Controls.Add(new Label
         {
-            Text = "Ports become UNTAGGED on the new VLAN with tagged VLANs removed (access port). Exception: on 6000-series switches, trunks with 'allowed all' keep their trunk config and only change native VLAN. LAG ports are never changed.",
+            Text = "Ports become UNTAGGED on the new VLAN with tagged VLANs removed (access port). Exception: on 6000-series switches, trunks with 'allowed all' keep their trunk config and only change native VLAN. LAG ports are never changed. " +
+                   "Ports that have NAC (aaa port-access) configured are flagged; before applying you are asked whether to remove NAC from them as part of the change.",
             AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0, 6, 0, 0)
         });
 
@@ -160,9 +166,10 @@ public class VlanChangeDialog : Form
                 "";
             if (p.Row == null) continue;
             p.Row.SubItems[4].Text = p.Reason.Length > 0 ? p.Reason
-                : ConvertFor(p) ? $"Will become an ACCESS port: untagged {p.CurrentVlan} -> {NewVlan}, tagged VLANs removed"
+                : (ConvertFor(p) ? $"Will become an ACCESS port: untagged {p.CurrentVlan} -> {NewVlan}, tagged VLANs removed"
                 : p.CxTrunkAllowedAll ? $"6000-series trunk 'allowed all' stays as is - native VLAN {p.CurrentVlan} -> {NewVlan}"
-                                      : $"Access port: untagged {p.CurrentVlan} -> {NewVlan}";
+                                      : $"Access port: untagged {p.CurrentVlan} -> {NewVlan}")
+                  + (p.Nac.Length > 0 ? $" - NAC configured ({p.Nac}): you will be asked whether to remove it" : "");
             p.Row.ForeColor = p.Reason.Length > 0 ? Color.Gray : Color.Black;
             p.Row.Checked = p.Reason.Length == 0;
         }
@@ -185,6 +192,10 @@ public class VlanChangeDialog : Form
             sb.AppendLine($"ProVision/2530:  configure / " + (converting.Count > 0 ? $"[for each tagged VLAN of {string.Join(",", converting)}: vlan X ; no tagged <port> ; exit] / " : "") +
                           $"vlan {NewVlan} / untagged {string.Join(",", ports)} / exit / exit{(chkSave.Checked ? " / write memory" : "")}");
             sb.AppendLine($"AOS-CX/6000:     configure terminal / " + string.Join(" / ", g.Select(p => $"interface {p.Port} ; {(p.CxTrunkAllowedAll ? "vlan trunk native" : "vlan access")} {NewVlan} ; exit")) + $" / exit{(chkSave.Checked ? " / write memory" : "")}");
+            var nacPorts = g.Where(p => p.Nac.Length > 0).Select(p => p.Port).OrderBy(x => x, NaturalComparer.Instance).ToList();
+            if (nacPorts.Count > 0)
+                sb.AppendLine($"NAC on {string.Join(",", nacPorts)} - if you answer Yes to removing it (ProVision, after 'untagged'): " +
+                              string.Join(" / ", nacCommands.Select(l => l.Replace("{port}", "<port>", StringComparison.OrdinalIgnoreCase))));
             sb.AppendLine();
         }
         txtPreview.Text = sb.Length > 0 ? sb.ToString() : "(no eligible ports selected)";
@@ -225,6 +236,32 @@ public class VlanChangeDialog : Form
                 return;
         }
 
+        // NAC: ask once per run. Ports already known to have NAC are asked about up front; if a switch's fresh
+        // running config shows NAC on ports we did not know about, the same question is asked from the worker.
+        bool? removeNac = null;
+        if (!dryRun)
+        {
+            var known = selected.Where(p => p.Nac.Length > 0).Select(p => ($"{p.Switch.DisplayName} port {p.Port}", p.Nac)).ToList();
+            if (known.Count > 0)
+            {
+                removeNac = AskRemoveNac(known);
+                if (removeNac == null) return;
+            }
+        }
+        var nacOption = new SwitchClient.NacOption
+        {
+            Commands = nacCommands,
+            Ask = (host, ports) =>
+            {
+                if (removeNac != null) return removeNac;
+                var list = ports.Select(kv => ($"{host} port {kv.Key}", string.Join(", ", kv.Value))).ToList();
+                var answer = (bool?)Invoke(() => AskRemoveNac(list));
+                if (answer != null) removeNac = answer;        // remember for the remaining switches of this run
+                else cts?.Cancel();                            // Cancel: stop after this switch (which makes no changes)
+                return answer;
+            }
+        };
+
         cts = new CancellationTokenSource();
         SetBusy(true);
         int ok = 0, failed = 0;
@@ -237,7 +274,7 @@ public class VlanChangeDialog : Form
             try
             {
                 var creds = credentialsFor(sw);
-                var result = await Task.Run(() => SwitchClient.ChangeAccessVlan(sw, creds, actions, NewVlan, chkSave.Checked, dryRun, log, cts.Token), cts.Token);
+                var result = await Task.Run(() => SwitchClient.ChangeAccessVlan(sw, creds, actions, NewVlan, chkSave.Checked, dryRun, log, cts.Token, nacOption), cts.Token);
                 foreach (var p in g)
                 {
                     var text = result.PortResults.TryGetValue(p.Port, out var r) ? r : "No result";
@@ -246,9 +283,10 @@ public class VlanChangeDialog : Form
                     {
                         ok++; p.CurrentVlan = NewVlan; p.Row!.SubItems[2].Text = NewVlan;
                         if (ConvertFor(p)) p.IsTrunk = false;
+                        if (text.Contains("NAC removed", StringComparison.OrdinalIgnoreCase)) p.Nac = "";
                         ChangedPorts.Add((sw, p.Port, NewVlan));
                     }
-                    else if (!dryRun) failed++;
+                    else if (!dryRun && !text.StartsWith("Cancelled", StringComparison.OrdinalIgnoreCase)) failed++;
                     SetStatus(p, text + (!dryRun && isOk && chkSave.Checked && !result.ConfigSaved ? " (config NOT saved!)" : ""), isOk ? Color.DarkGreen : Color.Firebrick);
                 }
                 if (!dryRun && result.Ports.Count > 0)
@@ -279,6 +317,27 @@ public class VlanChangeDialog : Form
             foreach (var p in selected.Where(p => p.CurrentVlan == NewVlan)) { p.Reason = $"Done"; p.Row!.Checked = false; }
             btnApply.Enabled = false;
         }
+    }
+
+    /// <summary>
+    /// "Remove NAC from these ports?" - Yes = remove after the VLAN change, No = change the VLAN only,
+    /// Cancel (null) = do not change anything.
+    /// </summary>
+    private bool? AskRemoveNac(List<(string Where, string What)> ports)
+    {
+        var lines = ports.Take(15).Select(p => $"    {p.Where}:  {p.What}").ToList();
+        if (ports.Count > 15) lines.Add($"    ... and {ports.Count - 15} more");
+        var msg = $"NAC (aaa port-access) is configured on {ports.Count} of the ports you are changing:\n\n" +
+                  string.Join("\n", lines) +
+                  "\n\nRemove NAC from these ports as part of the VLAN change?\n\n" +
+                  "Yes      = change the VLAN and remove NAC (commands from 'Disable NAC on port'):\n" +
+                  string.Join("\n", nacCommands.Select(l => "              " + l)) +
+                  "\nNo       = change the VLAN only, leave NAC as it is\n" +
+                  "Cancel  = do not change anything";
+        var r = MessageBox.Show(this, msg, "NAC on the selected ports", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
+        if (r == DialogResult.Yes) return true;
+        if (r == DialogResult.No) return false;
+        return null;
     }
 
     private static void SetStatus(PortPlan p, string text, Color color)

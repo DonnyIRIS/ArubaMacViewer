@@ -223,6 +223,9 @@ public class MacEntry
     /// <summary>AOS-CX trunk port with "vlan trunk allowed all": VLAN changes only move its native VLAN.</summary>
     public bool CxTrunkAllowedAll { get; set; }
 
+    /// <summary>NAC configured on the port ("authenticator, mac-based, mixed"), from the running config; "" if none/unknown.</summary>
+    public string Nac { get; set; } = "";
+
     /// <summary>"Uplink to X" / "Downlink to X" when this port connects to another switch in the list; "" otherwise.</summary>
     public string SwitchLink { get; set; } = "";
     public string LinkedSwitchIp { get; set; } = "";
